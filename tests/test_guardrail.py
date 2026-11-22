@@ -3,12 +3,20 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
+from pydantic import AfterValidator
 
-from livekit.agents import Block, DecisionEvaluated, DecisionGuardrail, Steer, utils
-from livekit.agents.llm import ChatContext, ChatMessage, decisions
+from livekit.agents import (
+    Block,
+    DecisionEvaluated,
+    DecisionGuardrail,
+    Steer,
+    function_tool,
+    utils,
+)
+from livekit.agents.llm import ChatContext, ChatMessage, ToolContext, decisions
 from livekit.agents.llm.decisions import DecisionResponse, ProbabilityResult
 from livekit.agents.types import APIConnectOptions, FlushSentinel
 from livekit.agents.voice.events import ConversationItemAddedEvent, UserInputTranscribedEvent
@@ -80,9 +88,58 @@ def _user_message(text: str) -> ChatMessage:
     return ChatMessage(role="user", content=[text])
 
 
-async def _run_user_turn(session: StubSession, text: str) -> Block | Steer | None:
+@function_tool
+async def lookup_order(order_id: int, locale: str = "en") -> str:
+    """Look up an order."""
+    return "shipped"
+
+
+@function_tool
+async def end_call() -> None:
+    """End the call."""
+
+
+def _known_account(account: str) -> str:
+    # quotes the value, as a hand-written validator often does
+    raise ValueError(f"no such account: {account}")
+
+
+@function_tool
+async def set_account(account: Annotated[str, AfterValidator(_known_account)]) -> None:
+    """Switch to another account."""
+
+
+@function_tool(
+    raw_schema={
+        "name": "raw_lookup",
+        "description": "Look up an order.",
+        "parameters": {
+            "type": "object",
+            "properties": {"order_id": {"type": "integer"}},
+            "required": ["order_id"],
+        },
+    }
+)
+async def raw_lookup(raw_arguments: dict[str, object]) -> str:
+    return "shipped"
+
+
+TOOLS = [lookup_order, end_call, set_account, raw_lookup]
+
+
+async def _run_user_turn(
+    session: StubSession,
+    text: str,
+    *,
+    chat_ctx: ChatContext | None = None,
+    direct_tool_calls: bool = True,
+) -> Block | Steer | None:
     return await run_user_turn_checks(
-        session._guardrail, chat_ctx=ChatContext(), user_message=_user_message(text)
+        session._guardrail,
+        chat_ctx=chat_ctx or ChatContext(),
+        user_message=_user_message(text),
+        tool_ctx=ToolContext(TOOLS),
+        direct_tool_calls=direct_tool_calls,
     )
 
 
@@ -90,6 +147,96 @@ def test_combine_first_block_wins_then_steers_join() -> None:
     assert _combine([None, Steer("a"), Block(say="x"), Block(say="y")]) == Block(say="x")
     assert _combine([Steer("a"), None, Steer("b")]) == Steer(instructions="a\nb")
     assert _combine([None, None]) is None
+
+
+def test_combine_adds_up_tool_calls_and_keeps_the_first_conflicting_value() -> None:
+    combined = _combine(
+        [
+            Steer(tool_calls="end_call", tool_choice="lookup_order"),
+            Steer(instructions="Be brief.", tool_calls={"lookup_order": {"order_id": 1}}),
+            # disagrees with both handlers before it
+            Steer(tool_calls={"lookup_order": {"order_id": 2}}, tool_choice="end_call"),
+        ]
+    )
+    assert combined == Steer(
+        instructions="Be brief.",
+        tool_calls={"end_call": {}, "lookup_order": {"order_id": 1}},
+        tool_choice="lookup_order",
+    )
+
+
+def test_steer_needs_something_to_change() -> None:
+    with pytest.raises(ValueError, match="instructions, tool_calls or tool_choice"):
+        Steer()
+    # empty instructions change nothing, but a handler may build them from data
+    assert Steer("") == Steer(instructions="")
+
+
+@pytest.mark.parametrize(
+    "steer",
+    [
+        Steer(tool_calls="end_call"),
+        Steer(tool_calls=["end_call"], tool_choice="lookup_order"),
+        Steer(tool_calls={"lookup_order": {"order_id": 7}}),
+        Steer(tool_calls={"lookup_order": {"order_id": 7, "locale": "es"}, "end_call": {}}),
+        Steer(tool_calls={"raw_lookup": {"order_id": 7}}),
+    ],
+)
+async def test_user_turn_steer_with_tools_the_agent_has_is_returned(steer: Steer) -> None:
+    session = StubSession()
+    guardrail = DecisionGuardrail(session, model=ScriptedModel(lambda _: 1.0))  # type: ignore[arg-type]
+
+    @guardrail.on_user_turn(decisions=ABUSIVE, eager=False)
+    def before_reply(ev: DecisionEvaluated) -> Steer:
+        return steer
+
+    assert await _run_user_turn(session, "hello") == steer
+    await guardrail.aclose()
+
+
+@pytest.mark.parametrize(
+    "steer, direct_tool_calls, problem",
+    [
+        (Steer(tool_calls="lookup_ordr"), True, "no function tool `lookup_ordr`"),
+        (Steer(tool_choice="lookup_ordr"), True, "no function tool `lookup_ordr`"),
+        (Steer(tool_calls="lookup_order"), True, "order_id: missing"),
+        (Steer(tool_calls={"lookup_order": {"order_id": "seven"}}), True, "order_id: int_parsing"),
+        (Steer(tool_calls={"lookup_order": {"order_id": object()}}), True, "are not JSON"),
+        (Steer(tool_calls={"end_call": {"reason": "rude"}}), True, "unknown parameters reason"),
+        # a validator's own message is left out: it can repeat the value
+        (Steer(tool_calls={"set_account": {"account": "acct-777"}}), True, "account: value_error"),
+        # a raw schema is checked for what it requires
+        (Steer(tool_calls="raw_lookup"), True, "missing parameters order_id"),
+        (Steer(tool_calls="end_call"), False, "not supported with a realtime model"),
+        # the wrong shape, which the type hints don't stop at run time
+        (Steer(tool_calls={"lookup_order": None}), True, "tool_calls has to be"),  # type: ignore[dict-item]
+        (Steer(tool_calls=["end_call", {"lookup_order": 1}]), True, "tool_calls has to be"),  # type: ignore[list-item]
+    ],
+)
+@pytest.mark.parametrize("on_error, expected", [("allow", None), ("block", Block())])
+async def test_user_turn_steer_the_reply_cannot_apply_follows_on_error(
+    steer: Steer,
+    direct_tool_calls: bool,
+    problem: str,
+    on_error: Any,
+    expected: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = StubSession()
+    guardrail = DecisionGuardrail(session, model=ScriptedModel(lambda _: 1.0))  # type: ignore[arg-type]
+
+    @guardrail.on_user_turn(decisions=ABUSIVE, on_error=on_error, eager=False)
+    def before_reply(ev: DecisionEvaluated) -> Steer:
+        return steer
+
+    with caplog.at_level("ERROR", logger="livekit.agents"):
+        verdict = await _run_user_turn(session, "hello", direct_tool_calls=direct_tool_calls)
+    assert verdict == expected
+    reasons = [record.__dict__["error"] for record in caplog.records]
+    assert [problem in reason for reason in reasons] == [True]
+    # the reason names tools and parameters, never an argument's value
+    assert "seven" not in reasons[0] and "acct-777" not in reasons[0]
+    await guardrail.aclose()
 
 
 async def test_user_turn_block_and_steer() -> None:
@@ -120,9 +267,7 @@ async def test_user_turn_history_input_includes_conversation() -> None:
 
     chat_ctx = ChatContext()
     chat_ctx.add_message(role="assistant", content="How can I help?")
-    await run_user_turn_checks(
-        session._guardrail, chat_ctx=chat_ctx, user_message=_user_message("my order")
-    )
+    await _run_user_turn(session, "my order", chat_ctx=chat_ctx)
     assert model.inputs == ["assistant: How can I help?\nuser: my order"]
     await guardrail.aclose()
 
@@ -215,11 +360,7 @@ async def test_eager_history_is_reevaluated_when_the_context_changed() -> None:
     await asyncio.sleep(0)
 
     # unchanged context: the eager evaluation is reused
-    await run_user_turn_checks(
-        session._guardrail,
-        chat_ctx=session.agent_chat_ctx.copy(),
-        user_message=_user_message("it is 42"),
-    )
+    await _run_user_turn(session, "it is 42", chat_ctx=session.agent_chat_ctx.copy())
     assert len(model.inputs) == 1
 
     session.emit(
@@ -230,9 +371,7 @@ async def test_eager_history_is_reevaluated_when_the_context_changed() -> None:
     # on_user_turn_completed added a message: same transcript, different input
     edited = session.agent_chat_ctx.copy()
     edited.add_message(role="user", content="(order 42 was corrected to 43)")
-    await run_user_turn_checks(
-        session._guardrail, chat_ctx=edited, user_message=_user_message("it is 42")
-    )
+    await _run_user_turn(session, "it is 42", chat_ctx=edited)
     assert len(model.inputs) == 3
     assert "corrected to 43" in model.inputs[-1]
     await guardrail.aclose()
